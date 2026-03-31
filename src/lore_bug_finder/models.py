@@ -32,6 +32,7 @@ class SearchResult:
     body_text: str
     excerpt: str
     source_path: str
+    thread_key: str = ""
 
 
 @dataclass(slots=True)
@@ -51,4 +52,3 @@ class TriageDecision:
     report_path: str | None
     raw_response: str
     title: str
-

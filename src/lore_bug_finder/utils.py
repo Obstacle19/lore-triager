@@ -8,6 +8,12 @@ from datetime import UTC, datetime, time
 from email.utils import parsedate_to_datetime
 
 
+_CI_STATUS_PREFIX_RE = re.compile(
+    r"^[✓✗]\s+[A-Za-z0-9_.-]+:\s+(?:success|failure)\s+for\s+",
+    re.I,
+)
+
+
 def parse_email_date(value: str | None) -> tuple[str | None, int | None]:
     if not value:
         return None, None
@@ -59,6 +65,72 @@ def normalize_subject_line(value: str) -> str:
         normalized = updated
     normalized = re.sub(r"^\[(?:patch[^\]]*|rfc[^\]]*|resend[^\]]*)\]\s*", "", normalized, flags=re.I)
     return collapse_whitespace(normalized)
+
+
+def is_patchwork_author(author_email: str | None) -> bool:
+    if not author_email:
+        return False
+    lowered = author_email.strip().lower()
+    return lowered == "patchwork@emeril.freedesktop.org" or lowered.startswith("patchwork@")
+
+
+def is_ci_status_subject(subject: str) -> bool:
+    return bool(_CI_STATUS_PREFIX_RE.match(collapse_whitespace(subject)))
+
+
+def extract_patchwork_series_title(body_text: str | None) -> str | None:
+    if not body_text:
+        return None
+    collapsed = collapse_whitespace(body_text)
+    match = re.search(r"(?:^| )Series:\s*(.+?)\s+URL\s*:", collapsed, re.I)
+    if not match:
+        return None
+    title = collapse_whitespace(match.group(1))
+    return title or None
+
+
+def canonical_topic_title(
+    subject: str,
+    *,
+    author_email: str | None = None,
+    body_text: str | None = None,
+) -> str:
+    if is_patchwork_author(author_email):
+        series_title = extract_patchwork_series_title(body_text)
+        if series_title:
+            return series_title
+    normalized = normalize_subject_line(subject)
+    normalized = _CI_STATUS_PREFIX_RE.sub("", normalized)
+    return collapse_whitespace(normalized) or collapse_whitespace(subject)
+
+
+def build_topic_key(
+    subject: str,
+    thread_key: str | None,
+    *,
+    author_email: str | None = None,
+    body_text: str | None = None,
+) -> str:
+    title = canonical_topic_title(subject, author_email=author_email, body_text=body_text)
+    title = re.sub(r"\s*\(rev\d+\)$", "", title, flags=re.I).casefold()
+    base = (thread_key or "").strip().casefold()
+    return f"{base}::{title}" if base else title
+
+
+def representative_sort_key(
+    message_id: str,
+    thread_key: str | None,
+    author_email: str | None,
+    subject: str,
+    published_at: str | None,
+) -> tuple[int, int, int, str, str]:
+    return (
+        0 if (thread_key or "") == message_id else 1,
+        0 if not is_patchwork_author(author_email) else 1,
+        0 if not is_ci_status_subject(subject) else 1,
+        published_at or "9999-12-31T23:59:59+00:00",
+        message_id,
+    )
 
 
 def slugify(value: str, default: str = "report") -> str:

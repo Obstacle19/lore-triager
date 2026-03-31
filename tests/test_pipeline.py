@@ -10,10 +10,17 @@ from unittest import mock
 from urllib import error
 
 from lore_bug_finder.config import AppConfig
-from lore_bug_finder.db import connect, get_related_messages, initialize_database, search_messages, upsert_triage_result
+from lore_bug_finder.db import (
+    connect,
+    get_related_messages,
+    initialize_database,
+    search_messages,
+    upsert_message,
+    upsert_triage_result,
+)
 from lore_bug_finder.ingest import ingest_eml_tree, ingest_mbox
 from lore_bug_finder.llm import classify_candidate
-from lore_bug_finder.models import SearchResult, TriageDecision
+from lore_bug_finder.models import MessageRecord, SearchResult, TriageDecision
 from lore_bug_finder.reporting import rebuild_docs_index, write_report
 
 
@@ -160,7 +167,105 @@ class PipelineTests(unittest.TestCase):
                 connection.commit()
                 index_path = rebuild_docs_index(config, connection)
                 self.assertTrue(index_path.exists())
-                self.assertIn("Unsafe pointer bug in Rust foo", index_path.read_text(encoding="utf-8"))
+                self.assertIn("rust: fix unsafe pointer bug in foo", index_path.read_text(encoding="utf-8"))
+
+    def test_rebuild_docs_index_deduplicates_patchwork_ci_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = build_config(root)
+            config.ensure_runtime_dirs()
+            candidate1 = SearchResult(
+                message_id="<patchwork-success@example.com>",
+                subject="✓ Xe.CI.BAT: success for Rust GPU buddy allocator bindings (rev3)",
+                author_name="Patchwork",
+                author_email="patchwork@emeril.freedesktop.org",
+                date_utc="2026-03-20T05:38:14+00:00",
+                list_name="intel-xe.lists.freedesktop.org",
+                archive_url=None,
+                body_text="== Series Details == Series: Rust GPU buddy allocator bindings (rev3) URL : https://patchwork.freedesktop.org/series/162098/ State : success",
+                excerpt="Patchwork success notification",
+                source_path="memory-1",
+                thread_key="<20260320045711.43494-1-joelagnelf@nvidia.com>",
+            )
+            candidate2 = SearchResult(
+                message_id="<patchwork-failure@example.com>",
+                subject="✗ Xe.CI.FULL: failure for Rust GPU buddy allocator bindings (rev3)",
+                author_name="Patchwork",
+                author_email="patchwork@emeril.freedesktop.org",
+                date_utc="2026-03-21T01:36:51+00:00",
+                list_name="intel-xe.lists.freedesktop.org",
+                archive_url=None,
+                body_text="== Series Details == Series: Rust GPU buddy allocator bindings (rev3) URL : https://patchwork.freedesktop.org/series/162098/ State : failure",
+                excerpt="Patchwork failure notification",
+                source_path="memory-2",
+                thread_key="<20260320045711.43494-1-joelagnelf@nvidia.com>",
+            )
+            decision1 = TriageDecision(
+                message_id=candidate1.message_id,
+                query="rust bug",
+                scope="all",
+                model="heuristic",
+                relevant=True,
+                classification="rust_logic_bug",
+                confidence="medium",
+                exclude_reason="",
+                summary="Patchwork success result for the series.",
+                evidence="Series title matches the Rust GPU buddy allocator topic.",
+                published_at=candidate1.date_utc,
+                list_name=candidate1.list_name,
+                report_path=None,
+                raw_response="test",
+                title=candidate1.subject,
+            )
+            decision2 = TriageDecision(
+                message_id=candidate2.message_id,
+                query="rust bug",
+                scope="all",
+                model="heuristic",
+                relevant=True,
+                classification="rust_logic_bug",
+                confidence="medium",
+                exclude_reason="",
+                summary="Patchwork failure result for the same series.",
+                evidence="Series title matches the Rust GPU buddy allocator topic.",
+                published_at=candidate2.date_utc,
+                list_name=candidate2.list_name,
+                report_path=None,
+                raw_response="test",
+                title=candidate2.subject,
+            )
+            with connect(config.database_path) as connection:
+                initialize_database(connection)
+                for candidate in (candidate1, candidate2):
+                    upsert_message(
+                        connection,
+                        MessageRecord(
+                            message_id=candidate.message_id,
+                            subject=candidate.subject,
+                            author_name=candidate.author_name,
+                            author_email=candidate.author_email,
+                            date_utc=candidate.date_utc,
+                            date_epoch=0,
+                            list_name=candidate.list_name,
+                            thread_key=candidate.thread_key,
+                            archive_url=candidate.archive_url,
+                            references=candidate.thread_key,
+                            in_reply_to=candidate.thread_key,
+                            body_text=candidate.body_text,
+                            source_path=candidate.source_path,
+                        ),
+                    )
+                report_path1 = write_report(config, candidate1, decision1)
+                report_path2 = write_report(config, candidate2, decision2)
+                upsert_triage_result(connection, replace(decision1, report_path=report_path1))
+                upsert_triage_result(connection, replace(decision2, report_path=report_path2))
+                connection.commit()
+                index_path = rebuild_docs_index(config, connection)
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload), 1)
+            self.assertEqual(payload[0]["title"], "Rust GPU buddy allocator bindings (rev3)")
+            self.assertTrue((root / report_path1).exists() or (root / report_path2).exists())
+            self.assertFalse((root / report_path1).exists() and (root / report_path2).exists())
 
     def test_ingest_bad_charset_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

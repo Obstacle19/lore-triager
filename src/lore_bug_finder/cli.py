@@ -11,7 +11,7 @@ from lore_bug_finder.db import connect, get_related_messages, initialize_databas
 from lore_bug_finder.ingest import ingest_eml_tree, ingest_maildir, ingest_mbox
 from lore_bug_finder.llm import classify_candidate
 from lore_bug_finder.reporting import rebuild_docs_index, write_report
-from lore_bug_finder.utils import coerce_date_boundary
+from lore_bug_finder.utils import build_topic_key, coerce_date_boundary, representative_sort_key
 
 
 def _parse_scope(scope_value: str | None) -> list[str] | None:
@@ -40,6 +40,42 @@ def _open_db(config: AppConfig):
     connection = connect(config.database_path)
     initialize_database(connection)
     return connection
+
+
+def _dedupe_candidates(candidates):
+    groups = {}
+    for candidate in candidates:
+        key = build_topic_key(
+            candidate.subject,
+            candidate.thread_key,
+            author_email=candidate.author_email,
+            body_text=candidate.body_text,
+        )
+        best = groups.get(key)
+        if best is None:
+            groups[key] = candidate
+            continue
+        current_rank = representative_sort_key(
+            candidate.message_id,
+            candidate.thread_key,
+            candidate.author_email,
+            candidate.subject,
+            candidate.date_utc,
+        )
+        best_rank = representative_sort_key(
+            best.message_id,
+            best.thread_key,
+            best.author_email,
+            best.subject,
+            best.date_utc,
+        )
+        if current_rank < best_rank:
+            groups[key] = candidate
+    return sorted(
+        groups.values(),
+        key=lambda candidate: (candidate.date_utc or "", candidate.message_id),
+        reverse=True,
+    )
 
 
 def cmd_init(config: AppConfig, _args: argparse.Namespace) -> int:
@@ -132,19 +168,23 @@ def cmd_triage(config: AppConfig, args: argparse.Namespace) -> int:
     relevant_count = 0
     excluded_count = 0
     with _open_db(config) as connection:
-        candidates = search_messages(
+        raw_limit = max(args.limit * 4, args.limit)
+        raw_candidates = search_messages(
             connection,
             query_text=args.query,
             scopes=scopes,
-            limit=args.limit,
+            limit=raw_limit,
             after_epoch=after_epoch,
             before_epoch=before_epoch,
         )
+        candidates = _dedupe_candidates(raw_candidates)[: args.limit]
         if not candidates:
             print("No matching messages found for triage.")
             return 0
         print(f"Triage query filter: {query_label}")
         print(f"Triage scope filter: {scope_label}")
+        if len(raw_candidates) != len(candidates):
+            print(f"Deduplicated {len(raw_candidates)} raw hits down to {len(candidates)} unique topics.")
         for candidate in candidates:
             related_messages = get_related_messages(connection, candidate.message_id, limit=3)
             decision = classify_candidate(
